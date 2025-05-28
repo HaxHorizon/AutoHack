@@ -14,8 +14,8 @@ from email.message import EmailMessage
 import re
 from pymongo import MongoClient
 from datetime import datetime
-
-
+import time
+from requests.exceptions import ChunkedEncodingError, ConnectionError
 
 # Load environment variables from .env
 load_dotenv()
@@ -24,6 +24,7 @@ MONGO_URI = os.getenv("MONGO_URI")
 client = MongoClient(MONGO_URI)
 db = client.get_database("Buildathon")
 submissions_collection = db.get_collection("submissions")
+
 # Flask setup
 app = Flask(__name__)
 CORS(app)
@@ -42,14 +43,12 @@ OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 EMAIL_SENDER = os.getenv("EMAIL_SENDER")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 
-
 def extract_text_from_pdf(file_stream):
     text = ""
     with fitz.open(stream=file_stream.read(), filetype="pdf") as doc:
         for page in doc:
             text += page.get_text()
     return text
-
 
 def create_score_chart(scores):
     fig, ax = plt.subplots()
@@ -65,7 +64,6 @@ def create_score_chart(scores):
     plt.close(fig)
     buf.seek(0)
     return buf
-
 
 def send_email_with_charts(to_email, team_name, scores, chart_img_bytes, pdf_url, ai_reply):
     msg = EmailMessage()
@@ -110,6 +108,17 @@ Team HaxHorizon
     submissions_collection.insert_one(submission_data)
     print("Submission saved to MongoDB:", submission_data)
 
+def post_with_retries(url, json, headers, retries=3, backoff=2):
+    for attempt in range(1, retries + 1):
+        try:
+            response = requests.post(url, json=json, headers=headers, timeout=30)
+            response.raise_for_status()
+            return response
+        except (ChunkedEncodingError, ConnectionError) as e:
+            print(f"Request attempt {attempt} failed: {e}")
+            if attempt == retries:
+                raise
+            time.sleep(backoff * attempt)
 
 @app.route('/api/submit-pdf', methods=['POST'])
 def submit_pdf():
@@ -134,19 +143,21 @@ def submit_pdf():
         pdf_url = upload_result.get("secure_url")
         print("Uploaded to Cloudinary:", pdf_url)
 
-
         pdf_file.stream.seek(0)
         pdf_text = extract_text_from_pdf(pdf_file.stream)
-
 
         messages = [
             {
                 "role": "system",
-                "content": "You are an AI assistant that evaluates documents. Score the following parameters (0-10): Clarity, Structure, Originality, Grammar, and Relevance. Also provide a short suggestion per category."
+                "content": (
+                    "You are an AI assistant that evaluates documents. "
+                    "Score the following parameters (0-10): Clarity, Structure, Originality, Grammar, and Relevance. "
+                    "Also provide a short suggestion per category."
+                )
             },
             {
                 "role": "user",
-                "content": f"Analyze this document and provide scores and suggestions:\n\n{pdf_text[:10000]}"
+                "content": f"Analyze this document and provide scores and suggestions:\n\n{pdf_text[:100000]}"
             }
         ]
 
@@ -159,21 +170,18 @@ def submit_pdf():
             "model": "deepseek/deepseek-r1:free",
             "messages": messages,
             "temperature": 0.7,
-            "max_tokens": 2048
+            "max_tokens": 3000  # Reduced from 10000 to reduce load
         }
 
-        res = requests.post(OPENROUTER_API_URL, json=payload, headers=headers)
-        print("OpenRouter status:", res.status_code)
-
-        if res.status_code != 200:
-            error_detail = res.json().get("error", res.text)
-            return jsonify({"error": f"OpenRouter API error: {res.status_code} - {error_detail}"}), res.status_code
-
+        try:
+            res = post_with_retries(OPENROUTER_API_URL, json=payload, headers=headers)
+        except Exception as e:
+            print("OpenRouter API request failed:", str(e))
+            return jsonify({"error": "Failed to get response from OpenRouter API"}), 502
 
         analysis = res.json()
         ai_reply = analysis.get("choices", [{}])[0].get("message", {}).get("content", "No analysis result found")
         print("AI Reply:", ai_reply)
-
 
         score_matches = re.findall(r"(Clarity|Structure|Originality|Grammar|Relevance):\s*(\d+)", ai_reply)
         scores = {param: int(score) for param, score in score_matches}
